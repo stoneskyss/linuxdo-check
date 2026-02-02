@@ -59,8 +59,9 @@ SC3_PUSH_KEY = os.environ.get("SC3_PUSH_KEY")
 WXPUSH_URL = os.environ.get("WXPUSH_URL")
 WXPUSH_TOKEN = os.environ.get("WXPUSH_TOKEN")
 
-# 注意：浏览入口改成 /latest
-HOME_URL = "https://linux.do/latest"
+# 访问入口
+LIST_URL = "https://linux.do/latest"
+HOME_FOR_COOKIE = "https://linux.do/"
 LOGIN_URL = "https://linux.do/login"
 SESSION_URL = "https://linux.do/session"
 CSRF_URL = "https://linux.do/session/csrf"
@@ -91,7 +92,6 @@ class LinuxDoBrowser:
         self.browser = Chromium(co)
         self.page = self.browser.new_tab()
 
-        # curl_cffi session（用于接口登录）
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -103,7 +103,6 @@ class LinuxDoBrowser:
         )
 
     def _api_headers(self):
-        """用于接口（csrf/session）请求的 headers"""
         return {
             "User-Agent": self.session.headers.get("User-Agent"),
             "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -114,18 +113,16 @@ class LinuxDoBrowser:
         }
 
     def _html_headers(self):
-        """用于获取 HTML 页面的 headers（避免返回 json）"""
         return {
             "User-Agent": self.session.headers.get("User-Agent"),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9",
-            "Referer": "https://linux.do/",
+            "Referer": HOME_FOR_COOKIE,
         }
 
     def _get_csrf_token(self) -> str:
-        # 先访问一个 HTML 页面建立 cookie（不要用 JSON Accept）
         r0 = self.session.get(
-            "https://linux.do/",
+            HOME_FOR_COOKIE,
             headers=self._html_headers(),
             impersonate="chrome136",
             allow_redirects=True,
@@ -135,7 +132,6 @@ class LinuxDoBrowser:
             f"HOME: status={r0.status_code} ct={r0.headers.get('content-type')} url={getattr(r0, 'url', None)}"
         )
 
-        # 再拿 CSRF
         resp_csrf = self.session.get(
             CSRF_URL,
             headers=self._api_headers(),
@@ -195,7 +191,6 @@ class LinuxDoBrowser:
                 allow_redirects=True,
                 timeout=30,
             )
-
             logger.info(
                 f"LOGIN: status={resp_login.status_code} ct={resp_login.headers.get('content-type')} url={getattr(resp_login, 'url', None)}"
             )
@@ -227,58 +222,69 @@ class LinuxDoBrowser:
             )
         self.page.set.cookies(dp_cookies)
 
-        logger.info("Cookie 设置完成，导航至 /latest ...")
-        self.page.get(HOME_URL)
+        logger.info("Cookie 设置完成，导航至主题列表页 /latest ...")
+        self.page.get(LIST_URL)
 
-        # 等待主题列表渲染出来
+        # Discourse 前端渲染：更稳的等待策略
+        # 先等 main-outlet，再等 topic link
         try:
-            self.page.wait.ele("@id=list-area", timeout=25)
-            logger.info("页面 list-area 已加载")
+            self.page.wait.ele("@id=main-outlet", timeout=25)
         except Exception:
-            logger.warning("未在 /latest 等到 list-area，输出页面信息辅助定位")
-            logger.warning(f"url={self.page.url}")
-            logger.warning((self.page.html or "")[:400])
+            logger.warning("未等到 main-outlet，但继续尝试查找 topic link")
 
-        # 不再依赖 current-user 做唯一判断
-        html = self.page.html or ""
-        if ("list-area" in html) or ("topic-list" in html) or ("discourse" in html):
-            logger.info("登录后页面加载完成（基于页面结构判断）")
+        # 最稳：等到任何一个主题标题链接出现
+        ok = self._wait_any_topic_link(timeout=35)
+        if not ok:
+            logger.warning("未等到主题链接 a.raw-topic-link，输出页面信息辅助定位")
+            logger.warning(f"url={self.page.url}")
+            logger.warning((self.page.html or "")[:500])
+            # requests 已登录成功，这里不强行失败，避免影响通知/其它任务
             return True
 
-        logger.warning("页面结构不符合预期，但 requests 已登录成功，先放行继续执行")
+        logger.info("主题列表已渲染，登录&页面加载完成")
         return True
 
+    def _wait_any_topic_link(self, timeout=30) -> bool:
+        """等待 Discourse 主题标题链接出现"""
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                links = self.page.eles("css:a.raw-topic-link")
+                if links and len(links) > 0:
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.8)
+        return False
+
     def click_topic(self):
-        # 再次确保在主题列表页
+        # 确保在列表页
         if not self.page.url.startswith("https://linux.do/latest"):
-            self.page.get(HOME_URL)
+            self.page.get(LIST_URL)
 
-        # 等待 list-area 出现
-        try:
-            self.page.wait.ele("@id=list-area", timeout=25)
-        except Exception:
-            logger.error("未找到 list-area，可能页面未加载到主题列表页或被重定向")
+        if not self._wait_any_topic_link(timeout=35):
+            logger.error("未找到 a.raw-topic-link（主题标题链接），可能页面未渲染完成或结构变更")
             logger.error(f"当前URL: {self.page.url}")
-            logger.error((self.page.html or "")[:400])
+            logger.error((self.page.html or "")[:500])
             return False
 
-        try:
-            topic_list = self.page.ele("@id=list-area").eles(".:title")
-        except Exception as e:
-            logger.error(f"解析主题列表异常: {e}")
+        topic_links = self.page.eles("css:a.raw-topic-link")
+        if not topic_links:
+            logger.error("主题链接列表为空")
             logger.error(f"当前URL: {self.page.url}")
-            logger.error((self.page.html or "")[:400])
+            logger.error((self.page.html or "")[:500])
             return False
 
-        if not topic_list:
-            logger.error("未找到主题帖链接（可能站点结构变更）")
-            logger.error(f"当前URL: {self.page.url}")
-            logger.error((self.page.html or "")[:400])
-            return False
+        logger.info(f"发现 {len(topic_links)} 个主题帖，随机选择10个")
+        for a in random.sample(topic_links, min(10, len(topic_links))):
+            href = a.attr("href")
+            if not href:
+                continue
+            # 可能是相对路径
+            if href.startswith("/"):
+                href = "https://linux.do" + href
+            self.click_one_topic(href)
 
-        logger.info(f"发现 {len(topic_list)} 个主题帖，随机选择10个")
-        for topic in random.sample(topic_list, min(10, len(topic_list))):
-            self.click_one_topic(topic.attr("href"))
         return True
 
     @retry_decorator()
