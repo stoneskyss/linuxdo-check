@@ -10,6 +10,7 @@ on:
 jobs:
   run_script:
     runs-on: ubuntu-22.04
+    environment: LINUXDO
     steps:
       - uses: actions/checkout@v4
       - uses: browser-actions/setup-chrome@v1
