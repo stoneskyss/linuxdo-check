@@ -14,7 +14,7 @@ jobs:
       - name: Random delay (0–1 hour)
         shell: bash
         run: |
-          s=$(( RANDOM % 3600 ))
+          s=$(( RANDOM % 360 ))
           echo "Random sleep: $s seconds"
           sleep $s
 
