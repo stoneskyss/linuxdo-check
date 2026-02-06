@@ -472,8 +472,7 @@ class LinuxDoBrowser:
             return data.get("topic_id"), data.get("csrf"), data.get("url")
         except Exception:
             return None, None, None
-
-    def _post_timings_via_page_fetch(self, page, post_ids):
+     def _post_timings_via_page_fetch(self, page, post_ids):
     post_ids = [int(x) for x in post_ids if isinstance(x, (int, str)) and str(x).isdigit()]
     post_ids = sorted(set(post_ids))
     if not post_ids:
@@ -565,8 +564,6 @@ class LinuxDoBrowser:
 
     logger.info(f"timings: totals sent={self.timings_sent} ok={self.timings_ok} fail={self.timings_fail}")
     return ok
-
-
     # ----------------------------
     # Human-like reading (按你“可用脚本”的滚动节奏)
     # ----------------------------
