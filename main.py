@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 cron: 0 */6 * * *
 new Env("Linux.Do 签到")
@@ -8,7 +9,7 @@ import random
 import time
 import functools
 import re
-from urllib.parse import urlparse
+import tempfile
 from loguru import logger
 from DrissionPage import ChromiumOptions, Chromium
 from tabulate import tabulate
@@ -23,20 +24,24 @@ def retry_decorator(retries=3, min_delay=5, max_delay=10):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
+            last_err = None
             for attempt in range(retries):
                 try:
                     return func(*args, **kwargs)
                 except Exception as e:
+                    last_err = e
                     if attempt == retries - 1:
                         logger.error(f"函数 {func.__name__} 最终执行失败: {str(e)}")
-                    logger.warning(
-                        f"函数 {func.__name__} 第 {attempt + 1}/{retries} 次尝试失败: {str(e)}"
-                    )
-                    if attempt < retries - 1:
+                    else:
+                        logger.warning(
+                            f"函数 {func.__name__} 第 {attempt + 1}/{retries} 次尝试失败: {str(e)}"
+                        )
                         sleep_s = random.uniform(min_delay, max_delay)
-                        logger.info(f"将在 {sleep_s:.2f}s 后重试")
+                        logger.info(
+                            f"将在 {sleep_s:.2f}s 后重试 ({min_delay}-{max_delay}s 随机延迟)"
+                        )
                         time.sleep(sleep_s)
-            return None
+            raise last_err
 
         return wrapper
 
@@ -46,8 +51,7 @@ def retry_decorator(retries=3, min_delay=5, max_delay=10):
 # ----------------------------
 # Env & Config
 # ----------------------------
-# ⚠️ 不要主动 pop DISPLAY：你在 Actions 用 xvfb 时需要 DISPLAY
-# os.environ.pop("DISPLAY", None)
+# 注意：不要强行 pop DISPLAY；你在 Actions + Xvfb 时需要它
 os.environ.pop("DYLD_LIBRARY_PATH", None)
 
 USERNAME = os.environ.get("LINUXDO_USERNAME") or os.environ.get("USERNAME")
@@ -59,46 +63,58 @@ BROWSE_ENABLED = os.environ.get("BROWSE_ENABLED", "true").strip().lower() not in
     "off",
 ]
 
-# Headless：默认 true（Actions 更稳）；你要 xvfb + 非无头就设 HEADLESS=false
+# ✅ Actions + Xvfb 时可设 HEADLESS=false
 HEADLESS = os.environ.get("HEADLESS", "true").strip().lower() not in ["false", "0", "off"]
 
+# 每次运行最多进入多少个话题帖
 MAX_TOPICS = int(os.environ.get("MAX_TOPICS", "50"))
+
+# 每个话题至少/最多浏览多少“页/批次”评论
 MIN_COMMENT_PAGES = int(os.environ.get("MIN_COMMENT_PAGES", "5"))
 MAX_COMMENT_PAGES = int(os.environ.get("MAX_COMMENT_PAGES", "10"))
+
+# “翻一页评论”的判定：最大楼层号增长多少算 1 页
 PAGE_GROW = int(os.environ.get("PAGE_GROW", "10"))
 
+# 点赞概率（0~1）
 LIKE_PROB = float(os.environ.get("LIKE_PROB", "0.3"))
 
-# 推进楼层增长：大步滚动
+# 大步滚动距离（推进楼层增长）
 SCROLL_MIN = int(os.environ.get("SCROLL_MIN", "1000"))
 SCROLL_MAX = int(os.environ.get("SCROLL_MAX", "1600"))
 
-MAX_LOOP_FACTOR = float(os.environ.get("MAX_LOOP_FACTOR", "10"))
-
-# 阅读阈值（你要求默认写死 5/20，同时支持 env 覆盖）
-MIN_READ_STAY = float(os.environ.get("MIN_READ_STAY", "5"))
-READ_STATE_TIMEOUT = float(os.environ.get("READ_STATE_TIMEOUT", "20"))
-
-# 阅读节奏（按你那份脚本）
+# ✅ 借鉴你“可用脚本”的滚动节奏（更像真人）
 READ_SCROLL_MIN = int(os.environ.get("READ_SCROLL_MIN", "200"))
 READ_SCROLL_MAX = int(os.environ.get("READ_SCROLL_MAX", "500"))
 READ_INTERVAL_MIN = float(os.environ.get("READ_INTERVAL_MIN", "1"))
 READ_INTERVAL_MAX = float(os.environ.get("READ_INTERVAL_MAX", "3"))
-READ_TIME_MIN = float(os.environ.get("READ_TIME_MIN", "5"))
-READ_TIME_MAX = float(os.environ.get("READ_TIME_MAX", "15"))
 
-# near-bottom
+# ✅ 阅读停留（默认写死 5 / 20，你也可 env 覆盖）
+MIN_READ_STAY = float(os.environ.get("MIN_READ_STAY", "5"))
+READ_STATE_TIMEOUT = float(os.environ.get("READ_STATE_TIMEOUT", "20"))
+
+# 接近底部判定
 NEAR_BOTTOM_GAP = int(os.environ.get("NEAR_BOTTOM_GAP", "140"))
 BOTTOM_EXTRA_STAY_MIN = float(os.environ.get("BOTTOM_EXTRA_STAY_MIN", "6"))
 BOTTOM_EXTRA_STAY_MAX = float(os.environ.get("BOTTOM_EXTRA_STAY_MAX", "12"))
 
-# timings 批量大小（借鉴扩展）
+# ✅ timings（按你扩展 content.js 的默认值）
 TIMINGS_MIN_REQ = int(os.environ.get("TIMINGS_MIN_REQ", "8"))
 TIMINGS_MAX_REQ = int(os.environ.get("TIMINGS_MAX_REQ", "20"))
 TIMINGS_MIN_MS = int(os.environ.get("TIMINGS_MIN_MS", "800"))
 TIMINGS_MAX_MS = int(os.environ.get("TIMINGS_MAX_MS", "3000"))
 TIMINGS_BASE_DELAY_MS = int(os.environ.get("TIMINGS_BASE_DELAY_MS", "2500"))
-TIMINGS_RAND_DELAY_MS = int(os.environ.get("TIMINGS_RAND_DELAY_MS", "800"))
+TIMINGS_RANDOM_DELAY_MS = int(os.environ.get("TIMINGS_RANDOM_DELAY_MS", "800"))
+
+# ✅ 只对“仍有蓝点”的楼层做 timings（更稳）
+ONLY_TIMINGS_UNREAD = os.environ.get("ONLY_TIMINGS_UNREAD", "true").strip().lower() not in [
+    "false",
+    "0",
+    "off",
+]
+
+# DrissionPage 远程调试端口：避免 Actions 里 9222 冲突
+DP_PORT = int(os.environ.get("DP_PORT", str(random.randint(20000, 40000))))
 
 GOTIFY_URL = os.environ.get("GOTIFY_URL")
 GOTIFY_TOKEN = os.environ.get("GOTIFY_TOKEN")
@@ -106,12 +122,15 @@ SC3_PUSH_KEY = os.environ.get("SC3_PUSH_KEY")
 WXPUSH_URL = os.environ.get("WXPUSH_URL")
 WXPUSH_TOKEN = os.environ.get("WXPUSH_TOKEN")
 
+# 访问入口
 LIST_URL = "https://linux.do/latest"
 HOME_FOR_COOKIE = "https://linux.do/"
 LOGIN_URL = "https://linux.do/login"
 SESSION_URL = "https://linux.do/session"
 CSRF_URL = "https://linux.do/session/csrf"
+TIMINGS_URL = "https://linux.do/topics/timings"
 
+# 帖子正文选择器（用于确认已渲染）
 POST_CONTENT_CSS = "div.post__regular.regular.post__contents.contents"
 
 
@@ -128,40 +147,26 @@ class LinuxDoBrowser:
         else:
             platformIdentifier = "X11; Linux x86_64"
 
-        co = ChromiumOptions().incognito(True).set_argument("--no-sandbox")
+        co = ChromiumOptions().incognito(True)
 
-        # ✅ GitHub Actions 非无头时，最容易卡在 9222 连接失败
-        # 解决：给每次运行一个“独立 user-data-dir + 随机调试端口”
-        tmp_profile = f"/tmp/linuxdo_dp_profile_{int(time.time())}_{random.randint(1000,9999)}"
-        try:
-            if hasattr(co, "set_user_data_path"):
-                co.set_user_data_path(tmp_profile)
-            else:
-                co.set_argument(f'--user-data-dir={tmp_profile}')
-        except Exception:
-            co.set_argument(f'--user-data-dir={tmp_profile}')
+        # ✅ 避免 9222 冲突 / user-data 冲突
+        user_dir = tempfile.mkdtemp(prefix="dp_ud_")
+        co.set_user_data_path(user_dir)
+        co.set_local_port(DP_PORT)
 
-        dp_port = int(os.environ.get("DP_PORT", str(random.randint(9223, 9299))))
-        # DrissionPage 有的版本支持 set_local_port
-        try:
-            if hasattr(co, "set_local_port"):
-                co.set_local_port(dp_port)
-            else:
-                co.set_argument(f'--remote-debugging-port={dp_port}')
-        except Exception:
-            co.set_argument(f'--remote-debugging-port={dp_port}')
-
-        co.headless(HEADLESS)
-
-        # 避免后台节流
+        # ✅ 常见 Actions/容器参数
+        co.set_argument("--no-sandbox")
+        co.set_argument("--disable-dev-shm-usage")
+        co.set_argument("--disable-gpu")
+        co.set_argument("--disable-blink-features=AutomationControlled")
         co.set_argument("--disable-background-timer-throttling")
         co.set_argument("--disable-backgrounding-occluded-windows")
         co.set_argument("--disable-renderer-backgrounding")
 
-        # 一些常见稳定参数
-        co.set_argument("--disable-dev-shm-usage")
-        co.set_argument("--no-first-run")
-        co.set_argument("--no-default-browser-check")
+        # 无头控制
+        co.headless(HEADLESS)
+        if not HEADLESS:
+            co.set_argument("--start-maximized")
 
         co.set_user_agent(
             f"Mozilla/5.0 ({platformIdentifier}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
@@ -170,7 +175,7 @@ class LinuxDoBrowser:
         self.browser = Chromium(co)
         self.page = self.browser.new_tab()
 
-        # HTTP session：用于登录、connect info（不用于 timings）
+        # requests session 用于登录/通知，不用于 timings（timings 必须走浏览器上下文）
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -208,7 +213,7 @@ class LinuxDoBrowser:
         }
 
     # ----------------------------
-    # CSRF + Login
+    # CSRF + Login (requests)
     # ----------------------------
     def _get_csrf_token(self) -> str:
         self.session.get(
@@ -286,6 +291,7 @@ class LinuxDoBrowser:
 
         self.print_connect_info()
 
+        # 同步 Cookie 到 DrissionPage
         logger.info("同步 Cookie 到 DrissionPage...")
         cookies_dict = self.session.cookies.get_dict()
         dp_cookies = [
@@ -353,7 +359,7 @@ class LinuxDoBrowser:
 
     def wait_topic_posts_ready(self, page, timeout=60) -> bool:
         """
-        不依赖 #post_1：任意 post 有正文即可
+        ✅ 不依赖 #post_1：只要任意 post 有正文文本即视为 ready
         """
         end = time.time() + timeout
         while time.time() < end:
@@ -401,6 +407,9 @@ class LinuxDoBrowser:
     # Blue-dot / read-state helpers
     # ----------------------------
     def _post_has_blue_dot(self, page, post_id: int) -> bool:
+        """
+        蓝点判断：存在 .read-state 且不包含 class 'read' => 未读
+        """
         try:
             return bool(
                 page.run_js(
@@ -411,24 +420,6 @@ class LinuxDoBrowser:
                     const rs = root.querySelector('.topic-meta-data .read-state');
                     if (!rs) return false;
                     return !rs.classList.contains('read');
-                    """,
-                    post_id,
-                )
-            )
-        except Exception:
-            return False
-
-    def _post_is_read_ui(self, page, post_id: int) -> bool:
-        try:
-            return bool(
-                page.run_js(
-                    """
-                    const pid = arguments[0];
-                    const root = document.querySelector(`#post_${pid}`);
-                    if (!root) return false;
-                    const rs = root.querySelector('.topic-meta-data .read-state');
-                    if (!rs) return false;
-                    return rs.classList.contains('read');
                     """,
                     post_id,
                 )
@@ -458,142 +449,139 @@ class LinuxDoBrowser:
             return []
 
     # ----------------------------
-    # Topic id / csrf from page
+    # timings (按扩展 content.js 逻辑：在浏览器上下文 fetch + headers + form)
     # ----------------------------
-    def _get_topic_id_from_url(self, page) -> int:
+    def _get_topic_id_and_csrf(self, page):
         """
-        /t/topic/1564445/29  或 /t/topic/1564445
+        返回 (topic_id:int|None, csrf:str|None)
+        topic_id：按你扩展里的方式从 pathname split 取第 4 段
         """
         try:
-            u = page.url or ""
-            path = urlparse(u).path
-            parts = [p for p in path.split("/") if p]
-            # 期望: ['t','topic','1564445','29']
-            for i in range(len(parts) - 1):
-                if parts[i] == "topic" and parts[i + 1].isdigit():
-                    return int(parts[i + 1])
-            # 兜底：取 path 里的第一个长数字
-            m = re.search(r"/topic/(\\d+)", path)
-            if m:
-                return int(m.group(1))
-        except Exception:
-            pass
-        return 0
-
-    def _get_csrf_from_page(self, page) -> str:
-        try:
-            token = page.run_js(
-                """const el=document.querySelector('meta[name="csrf-token"]'); return el?el.getAttribute('content'):'';"""
+            data = page.run_js(
+                """
+                const csrfEl = document.querySelector('meta[name="csrf-token"]');
+                const csrf = csrfEl ? csrfEl.getAttribute('content') : null;
+                const parts = window.location.pathname.split('/').filter(Boolean);
+                // 常见：/t/topic/1564445/29 => parts = ['t','topic','1564445','29']
+                const tid = (parts.length >= 3) ? parseInt(parts[2], 10) : null;
+                return {topic_id: tid, csrf: csrf, url: location.href};
+                """
             )
-            return token or ""
+            if not data:
+                return None, None, None
+            return data.get("topic_id"), data.get("csrf"), data.get("url")
         except Exception:
-            return ""
+            return None, None, None
 
-    # ----------------------------
-    # timings (IMPORTANT): must be sent via browser fetch
-    # ----------------------------
-    def _timings_sleep(self):
-        ms = TIMINGS_BASE_DELAY_MS + random.randint(0, TIMINGS_RAND_DELAY_MS)
-        time.sleep(ms / 1000.0)
-
-    def _post_timings_via_browser_fetch(self, page, topic_id: int, post_ids):
+    def _post_timings_via_page_fetch(self, page, post_ids):
         """
-        在页面上下文里 fetch /topics/timings
+        ✅ 模仿扩展：POST /topics/timings
+        - headers: accept */*, x-csrf-token, discourse-present/background/logged-in, x-requested-with, x-silence-logger
+        - body: timings[pid]=随机毫秒 + topic_time + topic_id
+        - referrer: 当前 topic 页面 URL（更像真实）
         """
-        if not topic_id or not post_ids:
-            return False
+        post_ids = [int(x) for x in post_ids if isinstance(x, (int, str)) and str(x).isdigit()]
+        post_ids = sorted(set(post_ids))
+        if not post_ids:
+            return None
 
-        csrf = self._get_csrf_from_page(page)
-        if not csrf:
-            logger.warning("timings: 页面未取到 csrf-token，跳过本次")
-            return False
+        topic_id, csrf, ref_url = self._get_topic_id_and_csrf(page)
+        if not topic_id or not csrf or not ref_url:
+            logger.warning("timings(fetch): 无法获取 topic_id/csrf/ref_url，跳过")
+            return None
 
-        # 生成 timings 参数（按扩展逻辑随机 ms）
-        timings = {}
-        for pid in post_ids:
-            timings[int(pid)] = random.randint(TIMINGS_MIN_MS, TIMINGS_MAX_MS)
+        # 生成 timings 值（借鉴扩展：每楼随机 min~max）
+        timings_map = {pid: random.randint(TIMINGS_MIN_MS, TIMINGS_MAX_MS) for pid in post_ids}
+        topic_time = sum(timings_map.values())
 
-        topic_time = sum(timings.values())
-        # 允许 topic_time 有一点随机浮动更像真实
-        topic_time = max(topic_time, random.randint(TIMINGS_MIN_MS * len(post_ids), TIMINGS_MAX_MS * len(post_ids)))
-
-        # 拼 form body（timings[xx]=ms）
+        # 组装 body（按 form）
         body_pairs = []
-        for pid, ms in timings.items():
-            body_pairs.append(f"timings%5B{pid}%5D={ms}")  # timings[pid]
+        for pid, ms in timings_map.items():
+            body_pairs.append(f"timings[{pid}]={ms}")
         body_pairs.append(f"topic_time={topic_time}")
         body_pairs.append(f"topic_id={topic_id}")
         body = "&".join(body_pairs)
 
-        # 记录日志
-        self.timings_sent += 1
-        ref = page.url
+        # 让每次请求大小更像扩展：如果传入 post_ids 过少，可“填充”到 1~N（但只在你允许时）
+        # 这里默认不填充，只提交你这次阅读涉及的楼层
 
+        js = """
+        return (async () => {
+          try {
+            const url = arguments[0];
+            const body = arguments[1];
+            const csrf = arguments[2];
+            const ref = arguments[3];
+
+            const resp = await fetch(url, {
+              method: "POST",
+              mode: "cors",
+              credentials: "include",
+              referrer: ref,
+              headers: {
+                "accept": "*/*",
+                "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "discourse-background": "true",
+                "discourse-logged-in": "true",
+                "discourse-present": "true",
+                "x-csrf-token": csrf,
+                "x-requested-with": "XMLHttpRequest",
+                "x-silence-logger": "true"
+              },
+              body
+            });
+
+            let head = "";
+            try { head = (await resp.text()).slice(0, 160); } catch(e) {}
+            return {ok: resp.ok, status: resp.status, head: head};
+          } catch (e) {
+            return {ok: false, status: -1, head: String(e).slice(0,160)};
+          }
+        })();
+        """
+
+        result = None
         try:
-            status = page.run_js(
-                """
-                const csrf = arguments[0];
-                const body = arguments[1];
-                const ref = arguments[2];
-                return fetch("https://linux.do/topics/timings", {
-                  method: "POST",
-                  mode: "cors",
-                  credentials: "include",
-                  referrer: ref || "https://linux.do/",
-                  headers: {
-                    "accept": "*/*",
-                    "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "discourse-background": "true",
-                    "discourse-logged-in": "true",
-                    "discourse-present": "true",
-                    "x-csrf-token": csrf,
-                    "x-requested-with": "XMLHttpRequest",
-                    "x-silence-logger": "true"
-                  },
-                  body
-                }).then(r => r.status).catch(_ => -1);
-                """,
-                csrf,
-                body,
-                ref,
-            )
-
-            if int(status) == 200:
-                self.timings_ok += 1
-            else:
-                self.timings_fail += 1
-
-            logger.info(
-                f"timings(fetch): status={status} topic_id={topic_id} posts={sorted(post_ids)} topic_time={topic_time} body={body}"
-            )
-            logger.info(f"timings: totals sent={self.timings_sent} ok={self.timings_ok} fail={self.timings_fail}")
-            self._timings_sleep()
-            return int(status) == 200
+            result = page.run_js(js, TIMINGS_URL, body, csrf, ref_url)
         except Exception as e:
+            result = {"ok": False, "status": -2, "head": str(e)[:160]}
+
+        self.timings_sent += 1
+        ok = bool(result and result.get("ok"))
+        status = result.get("status") if result else None
+        head = (result.get("head") if result else "") or ""
+        if ok:
+            self.timings_ok += 1
+        else:
             self.timings_fail += 1
-            logger.warning(f"timings(fetch) exception: {e}")
-            logger.info(f"timings: totals sent={self.timings_sent} ok={self.timings_ok} fail={self.timings_fail}")
-            self._timings_sleep()
-            return False
+
+        logger.info(
+            f"timings(fetch): status={status} ok={1 if ok else 0} "
+            f"topic_id={topic_id} posts={post_ids} topic_time={topic_time} body={body}"
+        )
+        if not ok and head:
+            logger.info(f"timings(fetch): head={head}")
+
+        # 模仿扩展：请求之间加一点 delay
+        delay_ms = TIMINGS_BASE_DELAY_MS + random.randint(0, TIMINGS_RANDOM_DELAY_MS)
+        time.sleep(delay_ms / 1000.0)
+
+        logger.info(f"timings: totals sent={self.timings_sent} ok={self.timings_ok} fail={self.timings_fail}")
+        return ok
 
     # ----------------------------
-    # Human-like read (use your scroll rhythm)
+    # Human-like reading (按你“可用脚本”的滚动节奏)
     # ----------------------------
-    def _scroll_read_rhythm(self, page, duration_s: float):
+    def _read_like_human_with_scroll(self, page, seconds: float):
         """
-        按你那份脚本节奏：200~500px，1~3s，持续 duration
+        ✅ 完全按你那份“能用脚本”的节奏：
+        - 每次 scrollBy 200~500
+        - 间隔 1~3 秒
+        - 期间触发 scroll / focus / mousemove（加一点）
         """
-        start = time.time()
-        cnt = 0
-        while time.time() - start < duration_s:
+        end = time.time() + seconds
+        while time.time() < end:
             dist = random.randint(READ_SCROLL_MIN, READ_SCROLL_MAX)
-            try:
-                page.run_js("window.scrollBy(0, arguments[0]);", dist)
-            except Exception:
-                pass
-            cnt += 1
-
-            # 触发一些事件更像真人
             try:
                 page.run_js(
                     """
@@ -601,38 +589,27 @@ class LinuxDoBrowser:
                     try {
                       const ev = new MouseEvent('mousemove', {
                         clientX: 80 + Math.random()*600,
-                        clientY: 80 + Math.random()*500
+                        clientY: 80 + Math.random()*400
                       });
                       document.dispatchEvent(ev);
                     } catch(e) {}
-                    try { window.dispatchEvent(new Event('scroll')); } catch(e) {}
-                    """
+                    try {
+                      window.scrollBy(0, arguments[0]);
+                      window.dispatchEvent(new Event('scroll'));
+                    } catch(e) {}
+                    """,
+                    dist,
                 )
             except Exception:
                 pass
-
             time.sleep(random.uniform(READ_INTERVAL_MIN, READ_INTERVAL_MAX))
 
-            # 到底就停
-            try:
-                at_bottom = page.run_js(
-                    """return (window.innerHeight + window.scrollY) >= document.body.offsetHeight - 120;"""
-                )
-            except Exception:
-                at_bottom = False
-
-            if at_bottom:
-                break
-
-        return cnt
-
-    def _read_post_like_human(self, page, topic_id: int, post_id: int):
+    def _read_post_like_human(self, page, post_id: int):
         """
-        只读蓝点楼层：
-        - scrollIntoView
-        - 阅读滚动 5~15s
-        - 视口内的 posts 做 timings 上报（batch）
-        - UI 是否变 read 只做提示，不作为“是否计数”的硬条件
+        ✅ 只读“仍有蓝点”的楼层：
+        - 滚到楼层中间
+        - 按真人节奏滚动阅读 >= MIN_READ_STAY
+        - 阅读后：用扩展同款 fetch 提交 timings（核心）
         """
         try:
             page.run_js(
@@ -646,34 +623,31 @@ class LinuxDoBrowser:
         except Exception:
             pass
 
-        read_s = random.uniform(READ_TIME_MIN, READ_TIME_MAX)
-        read_s = max(read_s, MIN_READ_STAY)
-        logger.info(f"👀 阅读未读楼层 post_{post_id}（阅读滚动≈{read_s:.1f}s）")
+        stay = max(MIN_READ_STAY, random.uniform(MIN_READ_STAY, MIN_READ_STAY + 6.0))
+        logger.info(f"👀 阅读未读楼层 post_{post_id}（阅读滚动≈{stay:.1f}s）")
 
-        self._scroll_read_rhythm(page, read_s)
+        # 阅读滚动（按你那份“可用脚本”）
+        self._read_like_human_with_scroll(page, stay)
 
-        # 关键：提交 timings —— 用“当前视口内楼层”更接近真实（你抓包说视口内 5 个左右）
+        # ✅ 阅读后：从视口收集一批楼层去打 timings（更像你抓包：一次 3~6 个楼层）
         vp = self._list_visible_posts_in_viewport(page)
-        vp = [pid for pid in vp if pid >= 1]
-        if vp:
-            # batch 大小截断到 5~10 更像真实滚动
-            k = min(len(vp), random.randint(4, 7))
-            batch = vp[:k]
-            self._post_timings_via_browser_fetch(page, topic_id, batch)
+        if ONLY_TIMINGS_UNREAD:
+            vp = [pid for pid in vp if self._post_has_blue_dot(page, pid)]
+        if not vp:
+            # fallback：至少把当前 post_id 打进去
+            vp = [post_id]
 
-        # UI 状态：不强求一定变 read（你已经遇到“UI 不变但实际会发 timings”）
-        if self._post_is_read_ui(page, post_id):
+        # 控制 batch size，模仿扩展（minReq~maxReq）
+        want = random.randint(TIMINGS_MIN_REQ, TIMINGS_MAX_REQ)
+        batch = vp[:want]
+
+        ok = self._post_timings_via_page_fetch(page, batch)
+        if ok:
             return True
 
-        # 给一点点 UI 同步等待（非必须）
-        end = time.time() + min(READ_STATE_TIMEOUT, 6)
-        while time.time() < end:
-            if self._post_is_read_ui(page, post_id):
-                return True
-            time.sleep(0.5)
-
+        # 如果失败，不再死等 UI；仅提示（因为 UI 不一定同步）
         logger.warning(
-            f"⚠️ post_{post_id} 停留已达阈值但蓝点未消失（UI 未见 read-state.read；不一定代表未计阅读）"
+            f"⚠️ post_{post_id} 本次 timings 未成功（status!=200）；UI 未见 read-state.read 不代表一定没计阅读"
         )
         return False
 
@@ -697,7 +671,7 @@ class LinuxDoBrowser:
             return False
 
     # ----------------------------
-    # Browse replies (page grow)
+    # Browse replies (5-10 pages) + 只读蓝点楼层 + timings
     # ----------------------------
     def browse_replies_pages(self, page, min_pages=5, max_pages=10):
         if max_pages < min_pages:
@@ -707,21 +681,16 @@ class LinuxDoBrowser:
 
         self.wait_topic_posts_ready(page, timeout=60)
 
-        topic_id = self._get_topic_id_from_url(page)
-        if topic_id:
-            logger.info(f"topic_id={topic_id} (from url)")
-
         pages_done = 0
         last_max_no = self._max_post_number_in_dom(page)
         last_cnt = self._post_count_in_dom(page)
         logger.info(f"初始：max_post_no={last_max_no}, dom_posts={last_cnt}")
 
-        max_loops = int(target_pages * MAX_LOOP_FACTOR + 20)
-
+        max_loops = int(target_pages * 10 + 25)
         seen_read_attempts = set()
 
         for i in range(max_loops):
-            # 1) 大步滚动推进楼层增长
+            # 1) 大步滚动推进
             scroll_distance = random.randint(SCROLL_MIN, SCROLL_MAX)
             logger.info(f"[loop {i+1}] 向下滚动 {scroll_distance}px 浏览评论...")
             try:
@@ -729,20 +698,21 @@ class LinuxDoBrowser:
             except Exception:
                 pass
 
+            # 2) 等待加载
             time.sleep(random.uniform(1.0, 1.8))
 
-            # 2) 视口内只读蓝点（最多 1~3 个）
+            # 3) 视口内：只读“仍有蓝点”的楼层（最多 1~3 个）
             vp = self._list_visible_posts_in_viewport(page)
             unread = [pid for pid in vp if self._post_has_blue_dot(page, pid)]
             unread = [pid for pid in unread if pid not in seen_read_attempts]
 
-            if unread and topic_id:
+            if unread:
                 k = min(len(unread), random.randint(1, 3))
                 for pid in unread[:k]:
                     seen_read_attempts.add(pid)
-                    self._read_post_like_human(page, topic_id, pid)
+                    self._read_post_like_human(page, pid)
 
-            # 3) 页数判定
+            # 4) 页计数：max_post_no 增长
             cur_max_no = self._max_post_number_in_dom(page)
             cur_cnt = self._post_count_in_dom(page)
 
@@ -754,25 +724,18 @@ class LinuxDoBrowser:
                 last_max_no = cur_max_no
                 last_cnt = cur_cnt
 
-            # 4) near-bottom：额外阅读滚动（促发加载/自然 timings）
+            # 5) near-bottom：额外阅读滚动，促发加载/计时
             if self._near_bottom(page, gap=NEAR_BOTTOM_GAP):
                 extra = random.uniform(BOTTOM_EXTRA_STAY_MIN, BOTTOM_EXTRA_STAY_MAX)
-                logger.info(f"[loop {i+1}] 接近底部，额外阅读滚动≈{extra:.1f}s")
-                self._scroll_read_rhythm(page, extra)
+                logger.info(f"[loop {i+1}] 接近底部（gap<={NEAR_BOTTOM_GAP}px），额外阅读≈{extra:.1f}s")
+                self._read_like_human_with_scroll(page, extra)
 
-                # near-bottom 再补一次 timings（用视口）
-                if topic_id:
-                    vp2 = self._list_visible_posts_in_viewport(page)
-                    if vp2:
-                        k2 = min(len(vp2), random.randint(4, 7))
-                        self._post_timings_via_browser_fetch(page, topic_id, vp2[:k2])
-
-            # 5) 达标退出
+            # 6) 达标退出
             if pages_done >= target_pages:
                 logger.success("🎉 已达到目标评论页数，结束浏览")
                 return True
 
-            # 6) 到底退出
+            # 7) 到底判断
             try:
                 at_bottom = page.run_js(
                     "return (window.scrollY + window.innerHeight) >= (document.body.scrollHeight - 5);"
@@ -828,6 +791,7 @@ class LinuxDoBrowser:
         new_page = self.browser.new_tab()
         try:
             new_page.get(topic_url)
+
             self.wait_topic_posts_ready(new_page, timeout=60)
             time.sleep(random.uniform(1.0, 2.0))
 
@@ -841,6 +805,7 @@ class LinuxDoBrowser:
             )
             if not ok:
                 logger.warning("本主题未达到最小评论页数目标（可能帖子很短/到底/加载慢）")
+
         finally:
             try:
                 new_page.close()
@@ -899,8 +864,9 @@ class LinuxDoBrowser:
         status_msg = f"✅每日登录成功: {USERNAME}"
         if browse_enabled:
             status_msg += (
-                f" + 浏览完成(话题<= {MAX_TOPICS} 个, 评论{MIN_COMMENT_PAGES}-{MAX_COMMENT_PAGES}页, "
-                f"PAGE_GROW={PAGE_GROW}, HEADLESS={HEADLESS}, timings ok={self.timings_ok}/{self.timings_sent})"
+                f" + 浏览任务完成(话题<= {MAX_TOPICS} 个, 评论{MIN_COMMENT_PAGES}-{MAX_COMMENT_PAGES}页, "
+                f"PAGE_GROW={PAGE_GROW}, MIN_READ_STAY={MIN_READ_STAY}s, HEADLESS={HEADLESS}, DP_PORT={DP_PORT}, "
+                f"timings_ok={self.timings_ok}/{self.timings_sent})"
             )
 
         if GOTIFY_URL and GOTIFY_TOKEN:
@@ -976,6 +942,7 @@ class LinuxDoBrowser:
                 logger.info("完成浏览任务（含评论浏览）")
 
             self.send_notifications(BROWSE_ENABLED)
+
         finally:
             try:
                 self.page.close()
