@@ -474,100 +474,98 @@ class LinuxDoBrowser:
             return None, None, None
 
     def _post_timings_via_page_fetch(self, page, post_ids):
-        """
-        ✅ 模仿扩展：POST /topics/timings
-        - headers: accept */*, x-csrf-token, discourse-present/background/logged-in, x-requested-with, x-silence-logger
-        - body: timings[pid]=随机毫秒 + topic_time + topic_id
-        - referrer: 当前 topic 页面 URL（更像真实）
-        """
-        post_ids = [int(x) for x in post_ids if isinstance(x, (int, str)) and str(x).isdigit()]
-        post_ids = sorted(set(post_ids))
-        if not post_ids:
-            return None
+    post_ids = [int(x) for x in post_ids if isinstance(x, (int, str)) and str(x).isdigit()]
+    post_ids = sorted(set(post_ids))
+    if not post_ids:
+        return None
 
-        topic_id, csrf, ref_url = self._get_topic_id_and_csrf(page)
-        if not topic_id or not csrf or not ref_url:
-            logger.warning("timings(fetch): 无法获取 topic_id/csrf/ref_url，跳过")
-            return None
+    topic_id, csrf, ref_url = self._get_topic_id_and_csrf(page)
+    if not topic_id or not csrf or not ref_url:
+        logger.warning("timings(xhr): 无法获取 topic_id/csrf/ref_url，跳过")
+        return None
 
-        # 生成 timings 值（借鉴扩展：每楼随机 min~max）
-        timings_map = {pid: random.randint(TIMINGS_MIN_MS, TIMINGS_MAX_MS) for pid in post_ids}
-        topic_time = sum(timings_map.values())
+    timings_map = {pid: random.randint(TIMINGS_MIN_MS, TIMINGS_MAX_MS) for pid in post_ids}
+    topic_time = sum(timings_map.values())
 
-        # 组装 body（按 form）
-        body_pairs = []
-        for pid, ms in timings_map.items():
-            body_pairs.append(f"timings[{pid}]={ms}")
-        body_pairs.append(f"topic_time={topic_time}")
-        body_pairs.append(f"topic_id={topic_id}")
-        body = "&".join(body_pairs)
+    js = """
+    return (async () => {
+      try {
+        const postIds = arguments[0];
+        const timingsMap = arguments[1];
+        const topicId = arguments[2];
+        const topicTime = arguments[3];
+        const csrf = arguments[4];
+        const ref = arguments[5];
 
-        # 让每次请求大小更像扩展：如果传入 post_ids 过少，可“填充”到 1~N（但只在你允许时）
-        # 这里默认不填充，只提交你这次阅读涉及的楼层
+        const params = new URLSearchParams();
+        for (const pid of postIds) {
+          params.append(`timings[${pid}]`, String(timingsMap[pid] || 1000));
+        }
+        params.append("topic_time", String(topicTime));
+        params.append("topic_id", String(topicId));
+        const body = params.toString(); // ✅ timings%5B7%5D=...
 
-        js = """
-        return (async () => {
-          try {
-            const url = arguments[0];
-            const body = arguments[1];
-            const csrf = arguments[2];
-            const ref = arguments[3];
+        const resp = await new Promise((resolve) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open("POST", "/topics/timings", true);
+          xhr.withCredentials = true;
 
-            const resp = await fetch(url, {
-              method: "POST",
-              mode: "cors",
-              credentials: "include",
-              referrer: ref,
-              headers: {
-                "accept": "*/*",
-                "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "discourse-background": "true",
-                "discourse-logged-in": "true",
-                "discourse-present": "true",
-                "x-csrf-token": csrf,
-                "x-requested-with": "XMLHttpRequest",
-                "x-silence-logger": "true"
-              },
-              body
-            });
+          // ✅ 尽量贴近浏览器网络面板那组
+          xhr.setRequestHeader("accept", "*/*");
+          xhr.setRequestHeader("content-type", "application/x-www-form-urlencoded; charset=UTF-8");
+          xhr.setRequestHeader("x-csrf-token", csrf);
+          xhr.setRequestHeader("x-requested-with", "XMLHttpRequest");
+          xhr.setRequestHeader("x-silence-logger", "true");
+          xhr.setRequestHeader("discourse-present", "true");
+          xhr.setRequestHeader("discourse-logged-in", "true");
+          xhr.setRequestHeader("discourse-background", "true");
 
-            let head = "";
-            try { head = (await resp.text()).slice(0, 160); } catch(e) {}
-            return {ok: resp.ok, status: resp.status, head: head};
-          } catch (e) {
-            return {ok: false, status: -1, head: String(e).slice(0,160)};
-          }
-        })();
-        """
+          // 注意：浏览器不允许脚本直接设置 Referer header
+          // 但 xhr 的“发起页面”会自动带 referrer。我们这里确保在 topic 页执行即可。
 
-        result = None
-        try:
-            result = page.run_js(js, TIMINGS_URL, body, csrf, ref_url)
-        except Exception as e:
-            result = {"ok": False, "status": -2, "head": str(e)[:160]}
+          xhr.onload = () => resolve({status: xhr.status, text: xhr.responseText || ""});
+          xhr.onerror = () => resolve({status: -1, text: ""});
+          xhr.send(body);
+        });
 
-        self.timings_sent += 1
-        ok = bool(result and result.get("ok"))
-        status = result.get("status") if result else None
-        head = (result.get("head") if result else "") or ""
-        if ok:
-            self.timings_ok += 1
-        else:
-            self.timings_fail += 1
+        const head = (resp.text || "").slice(0, 160);
+        return {ok: resp.status >= 200 && resp.status < 300, status: resp.status, head: head, body: body};
+      } catch (e) {
+        return {ok: false, status: -2, head: String(e).slice(0,160), body: ""};
+      }
+    })();
+    """
 
-        logger.info(
-            f"timings(fetch): status={status} ok={1 if ok else 0} "
-            f"topic_id={topic_id} posts={post_ids} topic_time={topic_time} body={body}"
-        )
-        if not ok and head:
-            logger.info(f"timings(fetch): head={head}")
+    try:
+        result = page.run_js(js, post_ids, timings_map, topic_id, topic_time, csrf, ref_url)
+    except Exception as e:
+        result = {"ok": False, "status": -3, "head": str(e)[:160], "body": ""}
 
-        # 模仿扩展：请求之间加一点 delay
-        delay_ms = TIMINGS_BASE_DELAY_MS + random.randint(0, TIMINGS_RANDOM_DELAY_MS)
-        time.sleep(delay_ms / 1000.0)
+    self.timings_sent += 1
+    ok = bool(result and result.get("ok"))
+    status = result.get("status") if result else None
+    head = (result.get("head") if result else "") or ""
+    body = (result.get("body") if result else "") or ""
 
-        logger.info(f"timings: totals sent={self.timings_sent} ok={self.timings_ok} fail={self.timings_fail}")
-        return ok
+    if ok:
+        self.timings_ok += 1
+    else:
+        self.timings_fail += 1
+
+    logger.info(
+        f"timings(xhr): status={status} ok={1 if ok else 0} topic_id={topic_id} "
+        f"posts={post_ids} topic_time={topic_time} body={body}"
+    )
+    if (not ok) and head:
+        logger.info(f"timings(xhr): head={head}")
+
+    # 模仿扩展：请求间隔
+    delay_ms = TIMINGS_BASE_DELAY_MS + random.randint(0, TIMINGS_RANDOM_DELAY_MS)
+    time.sleep(delay_ms / 1000.0)
+
+    logger.info(f"timings: totals sent={self.timings_sent} ok={self.timings_ok} fail={self.timings_fail}")
+    return ok
+
 
     # ----------------------------
     # Human-like reading (按你“可用脚本”的滚动节奏)
