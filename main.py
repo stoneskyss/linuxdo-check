@@ -478,10 +478,10 @@ class LinuxDoBrowser:
             return int(data.get("topic_id") or 0), str(data.get("csrf") or ""), str(data.get("ref") or "")
         except Exception:
             return 0, "", ""
-
     def _post_timings_via_page_xhr(self, page, post_ids):
         """
         ✅ 用浏览器页内 XMLHttpRequest + URLSearchParams（自动 timings%5Bxx%5D）
+        ✅ DrissionPage run_js 不支持 list/dict 入参：这里全部转成字符串传入，再在 JS 里解析
         ✅ 记录 timings 日志
         """
         post_ids = [int(x) for x in post_ids if str(x).isdigit()]
@@ -494,21 +494,35 @@ class LinuxDoBrowser:
             logger.warning("timings(xhr): 无法获取 topic_id/csrf/ref_url，跳过")
             return None
 
-        timings_map = {pid: random.randint(TIMINGS_MIN_MS, TIMINGS_MAX_MS) for pid in post_ids}
-        topic_time = sum(timings_map.values())
+        # ✅ 不传 dict/list，改成 "pid=ms&pid=ms" 字符串
+        pairs = []
+        topic_time = 0
+        for pid in post_ids:
+            ms = random.randint(TIMINGS_MIN_MS, TIMINGS_MAX_MS)
+            topic_time += ms
+            pairs.append(f"{pid}={ms}")
+        pairs_str = "&".join(pairs)  # e.g. "3=1200&4=1800"
 
         js = r"""
         return (async () => {
           try {
-            const postIds = arguments[0];
-            const timingsMap = arguments[1];
-            const topicId = arguments[2];
-            const topicTime = arguments[3];
-            const csrf = arguments[4];
+            const pairsStr = arguments[0] || "";
+            const topicId = parseInt(arguments[1] || "0", 10);
+            const topicTime = parseInt(arguments[2] || "0", 10);
+            const csrf = arguments[3] || "";
 
             const params = new URLSearchParams();
-            for (const pid of postIds) {
-              params.append(`timings[${pid}]`, String(timingsMap[pid] || 1000));
+            // pairsStr: "3=1200&4=1800"
+            const parts = pairsStr.split("&").filter(Boolean);
+            const postIds = [];
+            for (const p of parts) {
+              const kv = p.split("=");
+              if (kv.length !== 2) continue;
+              const pid = parseInt(kv[0], 10);
+              const ms = parseInt(kv[1], 10);
+              if (!pid || !ms) continue;
+              postIds.push(pid);
+              params.append(`timings[${pid}]`, String(ms));
             }
             params.append("topic_time", String(topicTime));
             params.append("topic_id", String(topicId));
@@ -534,23 +548,26 @@ class LinuxDoBrowser:
             });
 
             const head = (resp.text || "").slice(0, 160);
-            return {ok: (resp.status >= 200 && resp.status < 300), status: resp.status, head, body};
+            const ok = (resp.status >= 200 && resp.status < 300);
+            return {ok, status: resp.status, head, body, postIds};
           } catch (e) {
-            return {ok: false, status: -2, head: String(e).slice(0,160), body: ""};
+            return {ok: false, status: -2, head: String(e).slice(0,160), body: "" , postIds: []};
           }
         })();
         """
 
         try:
-            result = page.run_js(js, post_ids, timings_map, topic_id, topic_time, csrf)
+            # ✅ 这里只传 str/int，不传 list/dict
+            result = page.run_js(js, pairs_str, int(topic_id), int(topic_time), str(csrf))
         except Exception as e:
-            result = {"ok": False, "status": -3, "head": str(e)[:160], "body": ""}
+            result = {"ok": False, "status": -3, "head": str(e)[:160], "body": "", "postIds": []}
 
         self.timings_sent += 1
         ok = bool(result and result.get("ok"))
         status = result.get("status") if result else None
         head = (result.get("head") if result else "") or ""
         body = (result.get("body") if result else "") or ""
+        postIds_js = result.get("postIds") if result else []
 
         if ok:
             self.timings_ok += 1
@@ -559,7 +576,7 @@ class LinuxDoBrowser:
 
         logger.info(
             f"timings(xhr): status={status} ok={1 if ok else 0} topic_id={topic_id} "
-            f"posts={post_ids} topic_time={topic_time} body={body}"
+            f"posts={postIds_js or post_ids} topic_time={topic_time} body={body}"
         )
         if (not ok) and head:
             logger.info(f"timings(xhr): head={head}")
@@ -569,7 +586,6 @@ class LinuxDoBrowser:
 
         logger.info(f"timings: totals sent={self.timings_sent} ok={self.timings_ok} fail={self.timings_fail}")
         return ok
-
     # ----------------------------
     # read like human (scroll rhythm 200~500 + 1~3s)
     # ----------------------------
